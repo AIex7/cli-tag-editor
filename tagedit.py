@@ -19,12 +19,16 @@ from __future__ import annotations
 import argparse
 import base64
 import curses
+import hashlib
 import io
 import json
 import locale
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1096,6 +1100,33 @@ class LineEditor:
 # ---------------------------------------------------------------------------
 
 KITTY_ART_IMAGE_ID = 42
+KITTY_SPEC_IMAGE_ID = 43
+
+
+def generate_spek_spectrogram(audio_path: Path, out_dir: Path) -> bytes:
+    """Generate a Spek-style spectrogram PNG with black background and axis labels via ffmpeg."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg not found in PATH")
+    digest = hashlib.sha1(str(audio_path).encode("utf-8", errors="replace")).hexdigest()[:16]
+    out_png = out_dir / f"{digest}.png"
+    cmd = [
+        ffmpeg_bin,
+        "-nostdin",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(audio_path),
+        "-lavfi",
+        "showspectrumpic=s=960x540:mode=combined:color=intensity:scale=log:fscale=lin:legend=0",
+        str(out_png),
+    ]
+    res = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+    if res.returncode != 0 or not out_png.is_file():
+        err = res.stderr.strip() or f"ffmpeg exited with code {res.returncode}"
+        raise RuntimeError(err)
+    return out_png.read_bytes()
 
 
 def supports_kitty_graphics() -> bool:
@@ -1218,9 +1249,15 @@ class TagEditorApp:
     C_VIOLET = 1
     C_YELLOW = 2
 
-    def __init__(self, tracks: List[AudioTrack], root_label: str) -> None:
+    def __init__(
+        self,
+        tracks: List[AudioTrack],
+        root_label: str,
+        show_spectrogram: bool = False,
+    ) -> None:
         self.all_tracks = tracks
         self.root_label = root_label
+        self.show_spectrogram = show_spectrogram
 
         self.focus: str = "left"  # "left" or "right"
         self.song_idx: int = 0
@@ -1243,15 +1280,25 @@ class TagEditorApp:
         self._loading_msg: str = ""
         self._stdscr: Optional[curses.window] = None
 
-        # Artwork rendering state
+        # Artwork & spectrogram rendering state
         self._use_kitty: bool = supports_kitty_graphics()
         self._use_truecolor: bool = supports_truecolor()
         self._pending_art: Optional[Tuple[AudioTrack, int, int, int, int]] = None
+        self._pending_spec: Optional[Tuple[AudioTrack, int, int, int, int]] = None
         self._pending_warn_emojis: List[Tuple[int, int]] = []
         self._prev_warn_emojis: List[Tuple[int, int]] = []
         self._kitty_shown_key: Optional[Tuple[Path, int, int, int, int]] = None
+        self._kitty_spec_shown_key: Optional[Tuple[Path, int, int, int, int]] = None
         self._png_cache: Dict[Path, bytes] = {}
         self._unicode_art_cache: Dict[Tuple[Path, int, int, int, int], bytes] = {}
+        self._spec_png_cache: Dict[Path, bytes] = {}
+        self._spec_error_cache: Dict[Path, str] = {}
+        self._unicode_spec_cache: Dict[Tuple[Path, int, int, int, int], bytes] = {}
+        self._spec_tmp_dir: Optional[Path] = (
+            Path(tempfile.mkdtemp(prefix="tagedit_spec_"))
+            if show_spectrogram
+            else None
+        )
 
     # -- Track filtering & selection helpers --
 
@@ -1347,23 +1394,41 @@ class TagEditorApp:
     # -- Main loop --
 
     def _clear_kitty_art(self) -> None:
-        if self._use_kitty and self._kitty_shown_key is not None:
+        if self._use_kitty and (
+            self._kitty_shown_key is not None or self._kitty_spec_shown_key is not None
+        ):
             try:
-                sys.stdout.buffer.write(build_kitty_delete_bytes())
+                out = bytearray()
+                if self._kitty_shown_key is not None:
+                    out.extend(build_kitty_delete_bytes(KITTY_ART_IMAGE_ID))
+                if self._kitty_spec_shown_key is not None:
+                    out.extend(build_kitty_delete_bytes(KITTY_SPEC_IMAGE_ID))
+                sys.stdout.buffer.write(out)
                 sys.stdout.buffer.flush()
             except OSError:
                 pass
             self._kitty_shown_key = None
+            self._kitty_spec_shown_key = None
+
+    def _clear_kitty_spec(self) -> None:
+        if self._use_kitty and self._kitty_spec_shown_key is not None:
+            try:
+                sys.stdout.buffer.write(build_kitty_delete_bytes(KITTY_SPEC_IMAGE_ID))
+                sys.stdout.buffer.flush()
+            except OSError:
+                pass
+            self._kitty_spec_shown_key = None
 
     def _flush_artwork(self, stdscr: curses.window) -> None:
         stale = [pos for pos in self._prev_warn_emojis if pos not in self._pending_warn_emojis]
         if stale or self._pending_warn_emojis:
             try:
-                out = bytearray()
+                out = bytearray(b"\x1b7")
                 for wy, wx in stale:
                     out.extend(f"\x1b[{wy + 1};{wx + 1}H  ".encode("ascii"))
                 for wy, wx in self._pending_warn_emojis:
                     out.extend(f"\x1b[{wy + 1};{wx + 1}H\x1b[1;33m⚠️\x1b[0m".encode("utf-8"))
+                out.extend(b"\x1b8")
                 sys.stdout.buffer.write(out)
                 sys.stdout.buffer.flush()
             except OSError:
@@ -1383,15 +1448,18 @@ class TagEditorApp:
         try:
             if self._use_kitty:
                 if self._kitty_shown_key != key:
+                    out = bytearray(b"\x1b7")
                     if self._kitty_shown_key is not None:
-                        sys.stdout.buffer.write(build_kitty_delete_bytes())
+                        out.extend(build_kitty_delete_bytes(KITTY_ART_IMAGE_ID))
                     png = self._png_cache.get(track.path)
                     if png is None:
                         png = encode_png_for_kitty(track.art_bytes)
                         self._png_cache[track.path] = png
-                    sys.stdout.buffer.write(
-                        build_kitty_graphics_bytes(png, row, col, cols, rows)
+                    out.extend(
+                        build_kitty_graphics_bytes(png, row, col, cols, rows, image_id=KITTY_ART_IMAGE_ID)
                     )
+                    out.extend(b"\x1b8")
+                    sys.stdout.buffer.write(out)
                     sys.stdout.buffer.flush()
                     self._kitty_shown_key = key
             else:
@@ -1408,7 +1476,90 @@ class TagEditorApp:
                     if len(self._unicode_art_cache) > 32:
                         self._unicode_art_cache.clear()
                     self._unicode_art_cache[key] = rendered
-                sys.stdout.buffer.write(rendered)
+                sys.stdout.buffer.write(b"\x1b7" + rendered + b"\x1b8")
+                sys.stdout.buffer.flush()
+        except Exception:
+            pass
+
+        self._flush_spectrogram(stdscr)
+
+    def _flush_spectrogram(self, stdscr: curses.window) -> None:
+        if self._pending_spec is None:
+            self._clear_kitty_spec()
+            return
+
+        track, row, col, cols, rows = self._pending_spec
+        if cols <= 0 or rows <= 0 or self._spec_tmp_dir is None:
+            self._clear_kitty_spec()
+            return
+
+        png = self._spec_png_cache.get(track.path)
+        if png is None and track.path not in self._spec_error_cache:
+            # Show waiting indicator while ffmpeg generates the spectrogram
+            try:
+                max_y, max_x = stdscr.getmaxyx()
+                safe_addstr(
+                    stdscr,
+                    max_y - 1,
+                    0,
+                    truncate_width(" Generating spectrogram...", max_x - 1),
+                    curses.color_pair(self.C_VIOLET) | curses.A_BOLD,
+                )
+                stdscr.refresh()
+            except curses.error:
+                pass
+            try:
+                png = generate_spek_spectrogram(track.path, self._spec_tmp_dir)
+                self._spec_png_cache[track.path] = png
+            except Exception as exc:
+                self._spec_error_cache[track.path] = str(exc)
+
+            # Restore footer bar after generation completes
+            try:
+                max_y, max_x = stdscr.getmaxyx()
+                stdscr.move(max_y - 1, 0)
+                stdscr.clrtoeol()
+                self._draw_footer(stdscr, max_y, max_x)
+                stdscr.refresh()
+            except curses.error:
+                pass
+
+        if png is None:
+            err = self._spec_error_cache.get(track.path, "Spectrogram unavailable")
+            safe_addstr(stdscr, row, col, truncate_width(f"Error: {err}", cols), curses.color_pair(self.C_VIOLET))
+            stdscr.refresh()
+            self._clear_kitty_spec()
+            return
+
+        key = (track.path, row, col, cols, rows)
+        try:
+            if self._use_kitty:
+                if self._kitty_spec_shown_key != key:
+                    out = bytearray(b"\x1b7")
+                    if self._kitty_spec_shown_key is not None:
+                        out.extend(build_kitty_delete_bytes(KITTY_SPEC_IMAGE_ID))
+                    out.extend(
+                        build_kitty_graphics_bytes(png, row, col, cols, rows, image_id=KITTY_SPEC_IMAGE_ID)
+                    )
+                    out.extend(b"\x1b8")
+                    sys.stdout.buffer.write(out)
+                    sys.stdout.buffer.flush()
+                    self._kitty_spec_shown_key = key
+            else:
+                rendered = self._unicode_spec_cache.get(key)
+                if rendered is None:
+                    rendered = build_unicode_halfblocks_bytes(
+                        png,
+                        row,
+                        col,
+                        cols,
+                        rows,
+                        truecolor=self._use_truecolor,
+                    )
+                    if len(self._unicode_spec_cache) > 32:
+                        self._unicode_spec_cache.clear()
+                    self._unicode_spec_cache[key] = rendered
+                sys.stdout.buffer.write(b"\x1b7" + rendered + b"\x1b8")
                 sys.stdout.buffer.flush()
         except Exception:
             pass
@@ -1445,17 +1596,24 @@ class TagEditorApp:
 
                 if ch == curses.KEY_RESIZE:
                     self._clear_kitty_art()
+                    self._prev_warn_emojis = []
+                    if hasattr(curses, "update_lines_cols"):
+                        curses.update_lines_cols()
+                    stdscr.clear()
                     continue
 
                 if not self.handle_input(ch):
                     break
         finally:
             self._clear_kitty_art()
+            if self._spec_tmp_dir is not None:
+                shutil.rmtree(self._spec_tmp_dir, ignore_errors=True)
 
     # -- Drawing --
 
     def draw(self, stdscr: curses.window) -> None:
         self._pending_art = None
+        self._pending_spec = None
         self._pending_warn_emojis = []
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
@@ -1493,10 +1651,12 @@ class TagEditorApp:
         # Overlays
         if self.mode == "help":
             self._pending_art = None
+            self._pending_spec = None
             self._pending_warn_emojis = []
             self._draw_help_modal(stdscr, max_y, max_x)
         elif self.mode == "confirm_quit":
             self._pending_art = None
+            self._pending_spec = None
             self._pending_warn_emojis = []
             self._draw_confirm_quit_modal(stdscr, max_y, max_x)
 
@@ -1888,31 +2048,14 @@ class TagEditorApp:
             tbl_attr,
         )
 
-        # Embedded artwork section (below tag table when single track has artwork)
+        # Embedded artwork (+ optional spectrogram) section below tag table
         if len(targets) == 1 and targets[0].art_bytes:
             t = targets[0]
-            art_header_y = bot_y + 1
+            art_top_y = bot_y + 1
             pane_inner_bottom = y + h - 1  # exclusive (bottom box border is at y+h-1)
-            avail_rows = pane_inner_bottom - art_header_y
-            if avail_rows >= 1:
-                prefix = "Artwork: "
-                safe_addstr(
-                    win,
-                    art_header_y,
-                    inner_x,
-                    prefix,
-                    curses.color_pair(self.C_VIOLET) | curses.A_BOLD,
-                )
-                info = t.art_info_label
-                safe_addstr(
-                    win,
-                    art_header_y,
-                    inner_x + str_width(prefix),
-                    truncate_width(info, max(1, inner_w - str_width(prefix))),
-                    curses.A_NORMAL,
-                )
+            avail_rows = pane_inner_bottom - art_top_y
             if avail_rows >= 3:
-                art_rows = min(14, avail_rows - 1)
+                art_rows = min(16, avail_rows - 1)  # leave 1 row below for centered captions
                 aspect = (
                     (t.art_width / t.art_height)
                     if (t.art_width > 0 and t.art_height > 0)
@@ -1921,7 +2064,80 @@ class TagEditorApp:
                 # Terminal cells are roughly 1:2 (width:height), so multiply width by 2
                 art_cols = max(4, min(inner_w, int(round(art_rows * 2.0 * aspect))))
                 if art_cols >= 4 and art_rows >= 2:
-                    self._pending_art = (t, art_header_y + 1, inner_x, art_cols, art_rows)
+                    self._pending_art = (t, art_top_y, inner_x, art_cols, art_rows)
+                    caption_y = art_top_y + art_rows
+
+                    def _draw_caption(cap_x: int, cap_w: int, prefix: str, body: str) -> None:
+                        full = prefix + body
+                        clipped = truncate_width(full, cap_w)
+                        start_x = cap_x + max(0, (cap_w - str_width(clipped)) // 2)
+                        p_part = truncate_width(prefix, str_width(clipped), ellipsis="")
+                        safe_addstr(
+                            win,
+                            caption_y,
+                            start_x,
+                            p_part,
+                            curses.color_pair(self.C_VIOLET) | curses.A_BOLD,
+                        )
+                        rem = str_width(clipped) - str_width(p_part)
+                        if rem > 0:
+                            safe_addstr(
+                                win,
+                                caption_y,
+                                start_x + str_width(p_part),
+                                clipped[len(p_part) :],
+                                curses.A_NORMAL,
+                            )
+
+                    _draw_caption(inner_x, art_cols, "Artwork: ", t.art_info_label)
+
+                    if self.show_spectrogram:
+                        spec_x = inner_x + art_cols + 2
+                        spec_avail_cols = (inner_x + inner_w) - spec_x
+                        y_axis_w = 5  # e.g. "22k │"
+                        spec_rows = art_rows - 1  # leave 1 row above caption for time axis
+                        if spec_avail_cols >= y_axis_w + 14 and spec_rows >= 3:
+                            nyq_khz = (t.sample_rate / 2000.0) if t.sample_rate > 0 else 22.05
+                            plot_x = spec_x + y_axis_w
+                            plot_y = art_top_y
+                            plot_cols = min(
+                                spec_avail_cols - y_axis_w,
+                                max(14, int(round(spec_rows * 2.4))),
+                            )
+
+                            # Crisp text Y-axis frequency labels (kHz)
+                            num_ticks = min(5, spec_rows)
+                            tick_rows: Dict[int, str] = {}
+                            for ti in range(num_ticks):
+                                r_off = round(ti * (spec_rows - 1) / max(1, num_ticks - 1))
+                                frac = 1.0 - (r_off / max(1, spec_rows - 1))
+                                freq_khz = nyq_khz * frac
+                                lbl = "0Hz" if freq_khz <= 0.05 else f"{int(round(freq_khz))}k"
+                                tick_rows[r_off] = lbl.rjust(3)
+
+                            for r_off in range(spec_rows):
+                                lbl = tick_rows.get(r_off, "   ")
+                                safe_addstr(win, plot_y + r_off, spec_x, lbl, curses.A_NORMAL)
+                                safe_addstr(win, plot_y + r_off, spec_x + 3, " │", curses.A_NORMAL)
+
+                            # Crisp text X-axis time labels under plot
+                            axis_y = plot_y + spec_rows
+                            safe_addstr(win, axis_y, spec_x + 3, " └" + ("─" * plot_cols), curses.A_NORMAL)
+                            if t.duration > 0 and plot_cols >= 12:
+                                t_start = "0:00"
+                                t_mid = format_duration(t.duration / 2.0)
+                                t_end = format_duration(t.duration)
+                                safe_addstr(win, axis_y, plot_x, t_start, curses.A_NORMAL)
+                                mid_x = plot_x + (plot_cols - len(t_mid)) // 2
+                                if mid_x > plot_x + len(t_start) + 1:
+                                    safe_addstr(win, axis_y, mid_x, t_mid, curses.A_NORMAL)
+                                end_x = plot_x + plot_cols - len(t_end)
+                                if end_x > plot_x + len(t_start) + 1:
+                                    safe_addstr(win, axis_y, end_x, t_end, curses.A_NORMAL)
+
+                            nyquist = f"0–{nyq_khz:.1f} kHz (Spek)"
+                            _draw_caption(plot_x, plot_cols, "Spectrogram: ", nyquist)
+                            self._pending_spec = (t, plot_y, plot_x, plot_cols, spec_rows)
 
     def _draw_footer(self, win: curses.window, max_y: int, max_x: int) -> None:
         hint_y = max_y - 1
@@ -2467,6 +2683,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Scan directories recursively.",
     )
+    parser.add_argument(
+        "--spectogram",
+        "--spectrogram",
+        dest="spectrogram",
+        action="store_true",
+        help="Generate and display a Spek-style spectrogram next to cover art (requires ffmpeg).",
+    )
     return parser.parse_args(argv)
 
 
@@ -2483,7 +2706,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         root_label = f"{len(args.paths)} paths"
 
     locale.setlocale(locale.LC_ALL, "")
-    app = TagEditorApp(tracks, root_label=root_label)
+    app = TagEditorApp(tracks, root_label=root_label, show_spectrogram=args.spectrogram)
     # Work around macOS system ncurses 5.7 bug with xterm-kitty's `rep` capability
     # dropping repeated multibyte UTF-8 box-drawing characters (`─`).
     if sys.platform == "darwin" and os.environ.get("TERM") == "xterm-kitty":
