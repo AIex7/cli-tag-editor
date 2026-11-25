@@ -1380,16 +1380,22 @@ class TagEditorApp:
         cleaned = " ".join(art.lower().split())
         return "" if cleaned == "unknown artist" else cleaned
 
+    @staticmethod
+    def _normalized_album(track: AudioTrack) -> str:
+        return " ".join(track.tags.get("album", "").strip().lower().split())
+
     def album_mismatch_reasons(self) -> List[str]:
         if len(self.all_tracks) <= 1:
             return []
         reasons: List[str] = []
-        albums = {t.tags.get("album", "").strip() for t in self.all_tracks}
+        albums = {self._normalized_album(t) for t in self.all_tracks}
         if len(albums) > 1:
             reasons.append("album")
-        eff_artists = {self._album_level_artist(t) for t in self.all_tracks}
-        if len(eff_artists) > 1:
-            reasons.append("effective artist")
+        all_comp = all(t.is_compilation for t in self.all_tracks)
+        if not all_comp:
+            eff_artists = {self._album_level_artist(t) for t in self.all_tracks}
+            if len(eff_artists) > 1:
+                reasons.append("effective artist")
         compilations = {t.is_compilation for t in self.all_tracks}
         if len(compilations) > 1:
             reasons.append("compilation")
@@ -1399,11 +1405,12 @@ class TagEditorApp:
         if len(self.all_tracks) <= 1:
             return set()
         flagged: set[Path] = set()
-        extractors = (
-            lambda t: t.tags.get("album", "").strip(),
-            self._album_level_artist,
+        extractors: List[object] = [
+            self._normalized_album,
             lambda t: t.is_compilation,
-        )
+        ]
+        if not all(t.is_compilation for t in self.all_tracks):
+            extractors.append(self._album_level_artist)
         for fn in extractors:
             vals = [fn(t) for t in self.all_tracks]
             counts = Counter(vals)
