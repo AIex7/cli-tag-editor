@@ -1121,6 +1121,7 @@ class TagEditorApp:
         self._use_truecolor: bool = supports_truecolor()
         self._pending_art: Optional[Tuple[AudioTrack, int, int, int, int]] = None
         self._pending_warn_emojis: List[Tuple[int, int]] = []
+        self._prev_warn_emojis: List[Tuple[int, int]] = []
         self._kitty_shown_key: Optional[Tuple[Path, int, int, int, int]] = None
         self._png_cache: Dict[Path, bytes] = {}
         self._unicode_art_cache: Dict[Tuple[Path, int, int, int, int], bytes] = {}
@@ -1228,15 +1229,19 @@ class TagEditorApp:
             self._kitty_shown_key = None
 
     def _flush_artwork(self, stdscr: curses.window) -> None:
-        if self._pending_warn_emojis:
+        stale = [pos for pos in self._prev_warn_emojis if pos not in self._pending_warn_emojis]
+        if stale or self._pending_warn_emojis:
             try:
                 out = bytearray()
+                for wy, wx in stale:
+                    out.extend(f"\x1b[{wy + 1};{wx + 1}H  ".encode("ascii"))
                 for wy, wx in self._pending_warn_emojis:
                     out.extend(f"\x1b[{wy + 1};{wx + 1}H\x1b[1;33m⚠️\x1b[0m".encode("utf-8"))
                 sys.stdout.buffer.write(out)
                 sys.stdout.buffer.flush()
             except OSError:
                 pass
+        self._prev_warn_emojis = list(self._pending_warn_emojis)
 
         if self._pending_art is None:
             self._clear_kitty_art()
