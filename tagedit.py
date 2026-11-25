@@ -20,10 +20,14 @@ import argparse
 import base64
 import curses
 import io
+import json
 import locale
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -726,6 +730,127 @@ def guess_tags_from_filename(path: Path) -> Dict[str, str]:
     return guessed
 
 
+GEMINI_TAG_FIELDS = (
+    "title",
+    "artist",
+    "albumartist",
+    "album",
+    "tracknumber",
+    "tracktotal",
+    "discnumber",
+    "disctotal",
+)
+
+
+def fetch_tags_from_gemini(
+    filenames: Sequence[str],
+    folder_name: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Dict[str, str]]:
+    """Query the Gemini AI Studio API to infer audio tags from filenames.
+
+    Reads GEMINI_API_KEY (or GOOGLE_API_KEY) and optional GEMINI_MODEL
+    (default: gemini-4-hydrogen) from environment variables.
+    Returns a mapping of filename -> {tag_key: value}.
+    """
+    api_key = (
+        os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+    )
+    if not api_key:
+        raise RuntimeError("Set GEMINI_API_KEY env var to use Gemini (G)")
+
+    model = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-4-hydrogen"
+    encoded_model = urllib.parse.quote(model, safe="")
+    encoded_key = urllib.parse.quote(api_key, safe="")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{encoded_model}:generateContent?key={encoded_key}"
+    )
+
+    file_list_json = json.dumps(list(filenames), ensure_ascii=False, indent=2)
+    prompt = (
+        "You are an audio metadata tagger. Given the folder name and list of audio filenames below, "
+        "determine the following tags for each file: title, artist, albumartist, album, "
+        "tracknumber, tracktotal, discnumber, disctotal.\n"
+        "- Return one JSON object per file with the exact input `filename`.\n"
+        "- Strip leading zeros from numeric fields (e.g. '04' -> '4').\n"
+        "- Use an empty string \"\" for any field you cannot reasonably determine.\n\n"
+        f"Folder name: {folder_name}\n"
+        f"Filenames:\n{file_list_json}\n"
+    )
+
+    item_properties = {
+        "filename": {"type": "STRING"},
+        **{k: {"type": "STRING"} for k in GEMINI_TAG_FIELDS},
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": item_properties,
+                    "required": ["filename", *GEMINI_TAG_FIELDS],
+                },
+            },
+        },
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_json = json.loads(exc.read().decode("utf-8", errors="replace"))
+            err_body = err_json.get("error", {}).get("message", "")
+        except Exception:
+            pass
+        detail = err_body or str(exc.reason)
+        raise RuntimeError(f"Gemini HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Gemini network error: {exc.reason}") from exc
+
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates")
+    parts = candidates[0].get("content", {}).get("parts") or []
+    raw_text = "".join(p.get("text", "") for p in parts).strip()
+    if not raw_text:
+        raise RuntimeError("Gemini returned empty response")
+
+    parsed = json.loads(raw_text)
+    if not isinstance(parsed, list):
+        raise RuntimeError("Gemini response was not a JSON array")
+
+    results: Dict[str, Dict[str, str]] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        fname = str(entry.get("filename", "")).strip()
+        if not fname:
+            continue
+        tag_map: Dict[str, str] = {}
+        for k in GEMINI_TAG_FIELDS:
+            val = entry.get(k)
+            if val is not None:
+                s = str(val).strip()
+                if s:
+                    tag_map[k] = s
+        results[fname] = tag_map
+    return results
+
+
 def discover_audio_files(targets: Sequence[str], recursive: bool = False) -> List[Path]:
     paths: List[Path] = []
     if not targets:
@@ -1115,6 +1240,8 @@ class TagEditorApp:
 
         self.status_msg: str = ""
         self.status_is_error: bool = False
+        self._loading_msg: str = ""
+        self._stdscr: Optional[curses.window] = None
 
         # Artwork rendering state
         self._use_kitty: bool = supports_kitty_graphics()
@@ -1287,6 +1414,7 @@ class TagEditorApp:
             pass
 
     def run(self, stdscr: curses.window) -> None:
+        self._stdscr = stdscr
         self.init_colors()
         curses.curs_set(0)
         stdscr.keypad(True)
@@ -1814,6 +1942,15 @@ class TagEditorApp:
             safe_addstr(win, hint_y, str_width(prompt), vis_text, curses.A_NORMAL)
             self.edit_cursor_pos = (hint_y, str_width(prompt) + cur_off)
             return
+        if self._loading_msg:
+            safe_addstr(
+                win,
+                hint_y,
+                1,
+                truncate_width(self._loading_msg, max_x - 2),
+                curses.color_pair(self.C_VIOLET) | curses.A_BOLD,
+            )
+            return
         if self.status_is_error and self.status_msg:
             safe_addstr(
                 win,
@@ -1832,7 +1969,8 @@ class TagEditorApp:
             ("s:", " save"),
             ("S:", " save all"),
             ("q:", " quit"),
-            ("g:", " guess missing tags from filename (track, disc, artist, title)"),
+            ("g:", " guess from filename"),
+            ("G:", " gemini tags"),
         ]
         violet_attr = curses.color_pair(self.C_VIOLET)
         cur_x = 1
@@ -1858,7 +1996,7 @@ class TagEditorApp:
             "Navigation",
             "  ↑/↓ or j/k       Move up / down",
             "  ←/→, h/l, Tab    Switch between Songs and Tags panes",
-            "  Home/End, g/G    Jump to top / bottom",
+            "  Home/End         Jump to top / bottom",
             "",
             "Editing",
             "  Enter / e        Edit selected tag (with text selected)",
@@ -1875,6 +2013,7 @@ class TagEditorApp:
             "  A / c            Select all visible / Clear selection",
             "  #                Auto-number tracks (1/N..N/N) in current order",
             "  g                Guess missing tags from filename",
+            "  G                Ask Gemini AI Studio API for tags (unsaved)",
             "  =                Copy Artist → Album Artist (or vice versa)",
             "  /                Search / filter songs",
             "  f                Toggle showing only incomplete (yellow) songs",
@@ -2059,6 +2198,38 @@ class TagEditorApp:
                 self._start_edit_current_tag()
         return True
 
+    def _run_gemini_lookup(self) -> None:
+        targets = self.active_tracks()
+        if not targets:
+            return
+        self._loading_msg = f"Querying Gemini for {len(targets)} file(s)..."
+        if self._stdscr is not None:
+            self.draw(self._stdscr)
+        try:
+            results = fetch_tags_from_gemini(
+                [t.name for t in targets],
+                folder_name=self.root_label,
+            )
+        except Exception as exc:
+            self.set_status(str(exc), error=True)
+            return
+        finally:
+            self._loading_msg = ""
+
+        updated = 0
+        for t in targets:
+            inferred = results.get(t.name)
+            if not inferred:
+                continue
+            changed = False
+            for k, v in inferred.items():
+                if v and t.tags.get(k, "") != v:
+                    t.set_tag(k, v)
+                    changed = True
+            if changed:
+                updated += 1
+        self.set_status(f"Gemini updated {updated} file(s) (unsaved)")
+
     def _save_tracks(self, tracks: List[AudioTrack]) -> bool:
         if not tracks:
             self.set_status("No unsaved changes to write")
@@ -2192,6 +2363,10 @@ class TagEditorApp:
                 self.set_status("No missing tags could be guessed from filename")
             return True
 
+        if ch == "G":
+            self._run_gemini_lookup()
+            return True
+
         if ch == "=":
             targets = self.active_tracks()
             updated = 0
@@ -2235,7 +2410,7 @@ class TagEditorApp:
                 self.song_idx = min(max(0, len(vis) - 1), self.song_idx + 10)
             elif ch == curses.KEY_HOME:
                 self.song_idx = 0
-            elif ch in (curses.KEY_END, "G"):
+            elif ch == curses.KEY_END:
                 self.song_idx = max(0, len(vis) - 1)
             elif ch in ("\n", "\r", curses.KEY_ENTER, "e"):
                 if vis:
@@ -2262,7 +2437,7 @@ class TagEditorApp:
                     self.tag_idx += 1
             elif ch == curses.KEY_HOME:
                 self.tag_idx = 0
-            elif ch in (curses.KEY_END, "G"):
+            elif ch == curses.KEY_END:
                 self.tag_idx = max(0, len(rows) - 1)
             elif ch in ("\n", "\r", curses.KEY_ENTER, "e"):
                 self._start_edit_current_tag()

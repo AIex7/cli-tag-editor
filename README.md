@@ -7,3 +7,8 @@ A lightweight terminal audio tag editor for MP3, M4A, FLAC, Ogg, and Opus files 
 ```sh
 uv run tagedit.py # run in directory with audio files
 ```
+
+## Environment Variables
+
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required for `G` (Gemini AI Studio tag lookup)
+- `GEMINI_MODEL` — optional model override (defaults to `gemini-4-hydrogen`)
