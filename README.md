@@ -8,6 +8,10 @@ A lightweight terminal audio tag editor for MP3, M4A, FLAC, Ogg, and Opus files 
 uv run tagedit.py # run in directory with audio files
 ```
 
+## Options
+
+- `--spectogram` — display spectrogram next to embedded cover art (requires `ffmpeg`)
+
 ## Environment Variables
 
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required for `G` (Gemini AI Studio tag lookup)
