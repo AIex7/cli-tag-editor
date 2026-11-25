@@ -1120,6 +1120,7 @@ class TagEditorApp:
         self._use_kitty: bool = supports_kitty_graphics()
         self._use_truecolor: bool = supports_truecolor()
         self._pending_art: Optional[Tuple[AudioTrack, int, int, int, int]] = None
+        self._pending_warn_emojis: List[Tuple[int, int]] = []
         self._kitty_shown_key: Optional[Tuple[Path, int, int, int, int]] = None
         self._png_cache: Dict[Path, bytes] = {}
         self._unicode_art_cache: Dict[Tuple[Path, int, int, int, int], bytes] = {}
@@ -1227,6 +1228,16 @@ class TagEditorApp:
             self._kitty_shown_key = None
 
     def _flush_artwork(self, stdscr: curses.window) -> None:
+        if self._pending_warn_emojis:
+            try:
+                out = bytearray()
+                for wy, wx in self._pending_warn_emojis:
+                    out.extend(f"\x1b[{wy + 1};{wx + 1}H\x1b[1;33m⚠️\x1b[0m".encode("utf-8"))
+                sys.stdout.buffer.write(out)
+                sys.stdout.buffer.flush()
+            except OSError:
+                pass
+
         if self._pending_art is None:
             self._clear_kitty_art()
             return
@@ -1312,6 +1323,7 @@ class TagEditorApp:
 
     def draw(self, stdscr: curses.window) -> None:
         self._pending_art = None
+        self._pending_warn_emojis = []
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
 
@@ -1348,9 +1360,11 @@ class TagEditorApp:
         # Overlays
         if self.mode == "help":
             self._pending_art = None
+            self._pending_warn_emojis = []
             self._draw_help_modal(stdscr, max_y, max_x)
         elif self.mode == "confirm_quit":
             self._pending_art = None
+            self._pending_warn_emojis = []
             self._draw_confirm_quit_modal(stdscr, max_y, max_x)
 
         stdscr.refresh()
@@ -1411,7 +1425,9 @@ class TagEditorApp:
         mismatches = self.album_mismatch_reasons()
         title_end = str_width(title)
         if mismatches:
-            safe_addstr(stdscr, 0, title_end, " ⚠️", curses.color_pair(self.C_YELLOW) | curses.A_BOLD)
+            safe_addstr(stdscr, 0, title_end, "   ", curses.A_NORMAL)
+            if title_end + 2 < max_x:
+                self._pending_warn_emojis.append((0, title_end + 1))
             warn_rest = f" album mismatch: {', '.join(mismatches)} "
             safe_addstr(stdscr, 0, title_end + 3, warn_rest, curses.color_pair(self.C_VIOLET) | curses.A_BOLD)
             title_end += 3 + str_width(warn_rest)
@@ -1500,7 +1516,6 @@ class TagEditorApp:
             is_mismatch = track.path in mismatch_paths
 
             sel_prefix = "●" if is_sel else " "
-            warn_prefix = "⚠️" if is_mismatch else "  "
             name_w = max(1, inner_w - 7)
             name_text = " " + pad_width(track.name, name_w) + " "
 
@@ -1520,9 +1535,10 @@ class TagEditorApp:
                 attr |= curses.A_BOLD
 
             sel_attr = curses.color_pair(self.C_VIOLET) | curses.A_BOLD if is_sel else curses.A_NORMAL
-            warn_attr = curses.color_pair(self.C_YELLOW) | curses.A_BOLD if is_mismatch else curses.A_NORMAL
             safe_addstr(win, y + 1 + row_i, x + 1, sel_prefix, sel_attr)
-            safe_addstr(win, y + 1 + row_i, x + 2, warn_prefix, warn_attr)
+            safe_addstr(win, y + 1 + row_i, x + 2, "  ", curses.A_NORMAL)
+            if is_mismatch:
+                self._pending_warn_emojis.append((y + 1 + row_i, x + 2))
             safe_addstr(win, y + 1 + row_i, x + 4, name_text, attr)
 
             mark_x = x + 4 + name_w + 2
